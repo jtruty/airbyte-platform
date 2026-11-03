@@ -28,6 +28,7 @@ import io.airbyte.config.JobConfig.ConfigType
 import io.airbyte.config.JobDiscoverCatalogConfig
 import io.airbyte.config.JobGetSpecConfig
 import io.airbyte.config.RefreshStream
+import io.airbyte.config.StandardSync
 import io.airbyte.config.StreamDescriptor
 import io.airbyte.config.WorkloadPriority
 import io.airbyte.config.persistence.StreamRefreshesRepository
@@ -35,6 +36,8 @@ import io.airbyte.config.persistence.StreamResetPersistence
 import io.airbyte.config.persistence.domain.StreamRefresh
 import io.airbyte.config.secrets.InlinedConfigWithSecretRefs
 import io.airbyte.config.secrets.toConfigWithRefs
+import io.airbyte.data.ConfigNotFoundException
+import io.airbyte.data.services.ConnectionService
 import io.airbyte.data.services.ScopedConfigurationService
 import io.airbyte.metrics.MetricClient
 import io.airbyte.persistence.job.models.JobRunConfig
@@ -189,6 +192,7 @@ internal class TemporalClientTest {
     val workflowClientWrapped = WorkflowClientWrapped(workflowClient, metricClient)
     val workflowServiceStubsWrapped = WorkflowServiceStubsWrapped(workflowServiceStubs, metricClient)
     val scopedConfigurationService = mockk<ScopedConfigurationService>(relaxed = true)
+    val connectionService = mockk<ConnectionService>(relaxed = true)
     connectionManagerUtils = spyk(ConnectionManagerUtils(workflowClientWrapped, metricClient))
     streamResetRecordsHelper = mockk(relaxed = true)
     temporalClient =
@@ -204,6 +208,7 @@ internal class TemporalClientTest {
           streamResetRecordsHelper,
           metricClient,
           scopedConfigurationService,
+          connectionService,
         ),
       )
   }
@@ -211,10 +216,12 @@ internal class TemporalClientTest {
   @Nested
   internal inner class RestartPerStatus {
     private lateinit var mConnectionManagerUtils: ConnectionManagerUtils
+    private lateinit var mConnectionService: ConnectionService
 
     @BeforeEach
     fun init() {
       mConnectionManagerUtils = mockk()
+      mConnectionService = mockk()
 
       val metricClient = mockk<MetricClient>(relaxed = true)
       val scopedConfigurationService = mockk<ScopedConfigurationService>(relaxed = true)
@@ -231,6 +238,7 @@ internal class TemporalClientTest {
             streamResetRecordsHelper,
             metricClient,
             scopedConfigurationService,
+            mConnectionService,
           ),
         )
     }
@@ -247,10 +255,40 @@ internal class TemporalClientTest {
       every { temporalClient.filterOutRunningWorkspaceId(workflowIds) } returns workflowIds
       every { mConnectionManagerUtils.safeTerminateWorkflow(eq(connectionId), any()) } returns mockk()
       every { mConnectionManagerUtils.startConnectionManagerNoSignal(eq(connectionId)) } returns mockk()
+      every { mConnectionService.getStandardSync(connectionId) } returns StandardSync().withStatus(StandardSync.Status.ACTIVE)
       mockWorkflowStatus(WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_FAILED)
-      temporalClient.restartClosedWorkflowByStatus(WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_FAILED)
+      val restarted = temporalClient.restartClosedWorkflowByStatus(WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_FAILED)
       verify { mConnectionManagerUtils.safeTerminateWorkflow(eq(connectionId), any()) }
       verify { mConnectionManagerUtils.startConnectionManagerNoSignal(eq(connectionId)) }
+      Assertions.assertEquals(1, restarted)
+    }
+
+    @Test
+    fun testRestartFailedSkipsDeletedConnection() {
+      val connectionId = UUID.randomUUID()
+      val workflowIds = mutableSetOf<UUID>(connectionId)
+
+      every { temporalClient.fetchClosedWorkflowsByStatus(WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_FAILED) } returns workflowIds
+      every { temporalClient.filterOutRunningWorkspaceId(workflowIds) } returns workflowIds
+      every { mConnectionService.getStandardSync(connectionId) } returns StandardSync().withStatus(StandardSync.Status.DEPRECATED)
+      val restarted = temporalClient.restartClosedWorkflowByStatus(WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_FAILED)
+      verify(exactly = 0) { mConnectionManagerUtils.safeTerminateWorkflow(any<UUID>(), any()) }
+      verify(exactly = 0) { mConnectionManagerUtils.startConnectionManagerNoSignal(any()) }
+      Assertions.assertEquals(0, restarted)
+    }
+
+    @Test
+    fun testRestartFailedSkipsMissingConnection() {
+      val connectionId = UUID.randomUUID()
+      val workflowIds = mutableSetOf<UUID>(connectionId)
+
+      every { temporalClient.fetchClosedWorkflowsByStatus(WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_FAILED) } returns workflowIds
+      every { temporalClient.filterOutRunningWorkspaceId(workflowIds) } returns workflowIds
+      every { mConnectionService.getStandardSync(connectionId) } throws ConfigNotFoundException("STANDARD_SYNC", connectionId.toString())
+      val restarted = temporalClient.restartClosedWorkflowByStatus(WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_FAILED)
+      verify(exactly = 0) { mConnectionManagerUtils.safeTerminateWorkflow(any<UUID>(), any()) }
+      verify(exactly = 0) { mConnectionManagerUtils.startConnectionManagerNoSignal(any()) }
+      Assertions.assertEquals(0, restarted)
     }
   }
 

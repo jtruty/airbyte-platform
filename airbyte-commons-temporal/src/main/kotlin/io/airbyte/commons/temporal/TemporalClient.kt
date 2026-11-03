@@ -32,12 +32,15 @@ import io.airbyte.config.JobGetSpecConfig
 import io.airbyte.config.RefreshStream
 import io.airbyte.config.StandardCheckConnectionInput
 import io.airbyte.config.StandardDiscoverCatalogInput
+import io.airbyte.config.StandardSync
 import io.airbyte.config.StreamDescriptor
 import io.airbyte.config.WorkloadPriority
 import io.airbyte.config.persistence.StreamRefreshesRepository
 import io.airbyte.config.persistence.StreamResetPersistence
 import io.airbyte.config.persistence.saveStreamsToRefresh
 import io.airbyte.config.secrets.toInlined
+import io.airbyte.data.ConfigNotFoundException
+import io.airbyte.data.services.ConnectionService
 import io.airbyte.data.services.ScopedConfigurationService
 import io.airbyte.data.services.shared.NetworkSecurityTokenKey
 import io.airbyte.metrics.MetricAttribute
@@ -115,6 +118,7 @@ class TemporalClient(
   private val streamResetRecordsHelper: StreamResetRecordsHelper,
   private val metricClient: MetricClient,
   private val scopedConfigurationService: ScopedConfigurationService,
+  private val connectionService: ConnectionService,
 ) {
   private val workflowNames = mutableSetOf<String>()
 
@@ -126,7 +130,7 @@ class TemporalClient(
    */
   fun restartClosedWorkflowByStatus(executionStatus: WorkflowExecutionStatus): Int {
     val workflowExecutionInfos = fetchClosedWorkflowsByStatus(executionStatus)
-    val nonRunningWorkflow = filterOutRunningWorkspaceId(workflowExecutionInfos)
+    val nonRunningWorkflow = filterOutRunningWorkspaceId(workflowExecutionInfos).filterNot { isConnectionDeleted(it) }
 
     nonRunningWorkflow.forEach { connectionId ->
       with(connectionManagerUtils) {
@@ -137,6 +141,15 @@ class TemporalClient(
 
     return nonRunningWorkflow.size
   }
+
+  // A deleted connection must not get a new workflow. Its Failed run stays in Temporal until retention ends.
+  // Without this check, self-heal starts a new workflow again after each termination.
+  private fun isConnectionDeleted(connectionId: UUID): Boolean =
+    try {
+      connectionService.getStandardSync(connectionId).status == StandardSync.Status.DEPRECATED
+    } catch (e: ConfigNotFoundException) {
+      true
+    }
 
   fun fetchClosedWorkflowsByStatus(executionStatus: WorkflowExecutionStatus): MutableSet<UUID> {
     var workflowExecutionsRequest =
